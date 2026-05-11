@@ -20,6 +20,9 @@ class TrainConfig:
     num_epochs: int = 5
     log_freq: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp: bool = True
+    use_compile: bool = True
+    num_workers: int = 4
 
 def main():
     cfg = TrainConfig()
@@ -39,12 +42,18 @@ def main():
         dataset,
         batch_size=cfg.batch_size,
         sampler=sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True if cfg.device.startswith("cuda") else False,
     )
 
     print(f"Total frames in dataset: {len(dataset)}")
     print(f"Total episodes: {dataset.num_episodes}")
 
     device = torch.device(cfg.device)
+    if cfg.device.startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     print("\nInstantiating base ACT policy with PushT configs...")
     input_features = {
@@ -65,6 +74,10 @@ def main():
     policy = ACTPolicy(config)
     policy.to(device)
 
+    if cfg.use_compile and cfg.device.startswith("cuda"):
+        print("\nCompiling policy with torch.compile()...")
+        policy = torch.compile(policy)
+
     print("\nCreating preprocessor...")
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
@@ -72,6 +85,8 @@ def main():
     )
 
     optimizer = optim.AdamW(policy.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
 
     print(f"\nStarting training for {cfg.num_epochs} epochs on {device}...")
 
@@ -85,13 +100,21 @@ def main():
             # Preprocess batch (normalize)
             batch = preprocessor(batch)
             
-            # Forward pass
-            loss, output_dict = policy.forward(batch)
+            optimizer.zero_grad(set_to_none=True) # Faster than zero_grad()
             
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if cfg.use_amp and cfg.device.startswith("cuda"):
+                # Use bfloat16 if supported, else float16
+                pt_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                with torch.amp.autocast(device_type="cuda", dtype=pt_dtype):
+                    loss, output_dict = policy.forward(batch)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss, output_dict = policy.forward(batch)
+                loss.backward()
+                optimizer.step()
             
             total_loss += loss.item()
             
