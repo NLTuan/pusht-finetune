@@ -19,6 +19,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     num_epochs: int = 5
     log_freq: int = 10
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 def main():
     cfg = TrainConfig()
@@ -43,7 +44,7 @@ def main():
     print(f"Total frames in dataset: {len(dataset)}")
     print(f"Total episodes: {dataset.num_episodes}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(cfg.device)
 
     print("\nInstantiating base ACT policy with PushT configs...")
     input_features = {
