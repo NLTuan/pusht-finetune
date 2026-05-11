@@ -1,13 +1,19 @@
+import os
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import wandb
+import gymnasium as gym
 from dataclasses import dataclass
+from collections import deque
+import contextlib
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionConfig, DiffusionPolicy
+from transformers import get_cosine_schedule_with_warmup
 
 @dataclass
 class TrainConfig:
@@ -16,16 +22,119 @@ class TrainConfig:
     n_obs_steps: int = 2       # Diffusion typically uses a history of observations
     n_action_steps: int = 8    # How many future actions to execute
     fps: int = 10
-    batch_size: int = 32
+    batch_size: int = 64
     lr: float = 1e-4
-    weight_decay: float = 1e-3
-    num_epochs: int = 10
-    log_freq: int = 10
-    noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
+    weight_decay: float = 1e-4
+    num_epochs: int = 200
+    log_freq: int = 50
+    noise_scheduler_type: str = "DDIM"  # Options: "DDPM", "DDIM"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     use_compile: bool = True
     num_workers: int = 4
+    
+    eval_freq: int = 20
+    num_eval_episodes: int = 20
+    num_inference_steps: int = 10
+    save_dir: str = "checkpoints/diffusion_pusht"
+    use_wandb: bool = True
+    wandb_project: str = "pusht-finetune"
+
+def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
+    """Run simulation rollouts to evaluate the policy."""
+    import imageio
+    import numpy as np
+    
+    # NOTE: You may need to import your specific env registration here (e.g., import gym_pusht)
+    import gym_pusht
+    try:
+        env = gym.make(env_id, render_mode="rgb_array")
+    except gym.error.NameNotFound:
+        print(f"\n⚠️ Environment {env_id} not found. Skipping evaluation.")
+        print("Please ensure your environment is registered with gymnasium.")
+        return 0.0, []
+
+    policy.eval()
+    successes = []
+    best_video_frames = []
+    
+    with torch.no_grad():
+        for ep in range(num_episodes):
+            obs, info = env.reset()
+            # Filter initial state to be within dataset distribution [120, 380]
+            # assuming obs[:2] is the agent position.
+            reset_count = 0
+            while (obs[0] < 120 or obs[0] > 380 or obs[1] < 120 or obs[1] > 380) and reset_count < 100:
+                obs, info = env.reset()
+                reset_count += 1
+                
+            done = False
+            
+            # Clear observation history / queues in the policy
+            if hasattr(policy, "reset"):
+                policy.reset()
+                
+            ep_frames = []
+            
+            frame = env.render()
+            if frame is not None:
+                ep_frames.append(frame)
+                
+            # We assume a max step limit if the env doesn't truncate
+            step_count = 0
+            while not done and step_count < 1000:
+                batch = {}
+                
+                # Handle images
+                if "observation.image" in policy.config.input_features:
+                    import torchvision.transforms as T
+                    transform = T.Compose([
+                        T.ToPILImage(),
+                        T.Resize((96, 96)),
+                        T.ToTensor(),
+                    ])
+                    img_tensor = transform(frame).to(device)
+                    batch["observation.image"] = img_tensor.unsqueeze(0)
+                
+                # Handle state
+                if "observation.state" in policy.config.input_features:
+                    # Assume first 2 dims are agent pos
+                    state_tensor = torch.from_numpy(obs[:2]).float().to(device)
+                    batch["observation.state"] = state_tensor.unsqueeze(0)
+                
+                # Preprocess (normalize)
+                batch = preprocessor(batch)
+                
+                # select_action automatically handles action chunking history internally!
+                action = policy.select_action(batch)
+                
+                # Unnormalize action
+                mean = torch.from_numpy(action_stats['mean']).to(device)
+                std = torch.from_numpy(action_stats['std']).to(device)
+                unnorm_action = action * std + mean
+                
+                action_np = unnorm_action.squeeze(0).cpu().numpy()
+                
+                obs, reward, terminated, truncated, info = env.step(action_np)
+                done = terminated or truncated
+                step_count += 1
+                
+                # Render frame for video and next step
+                frame = env.render()
+                if frame is not None:
+                    ep_frames.append(frame)
+            
+            is_success = info.get("is_success", False) or info.get("success", False) or reward > 0.9
+            successes.append(1.0 if is_success else 0.0)
+            
+            # Save the video of the first successful rollout (or the last rollout if none succeed)
+            if len(best_video_frames) == 0 or (is_success and sum(successes) == 1):
+                best_video_frames = ep_frames
+                
+    env.close()
+    policy.train()
+    success_rate = sum(successes) / num_episodes
+    return success_rate, best_video_frames
 
 def main():
     cfg = TrainConfig()
@@ -39,22 +148,45 @@ def main():
 
     dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps)
 
-    sampler = EpisodeAwareSampler(
-        dataset.meta.episodes["dataset_from_index"],
-        dataset.meta.episodes["dataset_to_index"],
+    print(f"Total frames in dataset: {len(dataset)}")
+    print(f"Total episodes: {dataset.num_episodes}")
+
+    # Split dataset into 90% Train / 10% Validation based on episodes
+    total_episodes = dataset.num_episodes
+    val_split_idx = int(total_episodes * 0.9)
+    print(f"Splitting into {val_split_idx} Train episodes and {total_episodes - val_split_idx} Val episodes.")
+
+    # Training Sampler (Episodes 0 to val_split_idx)
+    train_sampler = EpisodeAwareSampler(
+        dataset.meta.episodes["dataset_from_index"][:val_split_idx],
+        dataset.meta.episodes["dataset_to_index"][:val_split_idx],
         drop_n_last_frames=cfg.horizon,
         shuffle=True,
     )
 
-    dataloader = DataLoader(
+    train_dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        sampler=sampler,
+        sampler=train_sampler,
         num_workers=cfg.num_workers,
         pin_memory=True if cfg.device.startswith("cuda") else False,
     )
 
-    print(f"Total frames in dataset: {len(dataset)}")
+    # Validation Sampler (Episodes val_split_idx to end)
+    val_sampler = EpisodeAwareSampler(
+        dataset.meta.episodes["dataset_from_index"][val_split_idx:],
+        dataset.meta.episodes["dataset_to_index"][val_split_idx:],
+        drop_n_last_frames=cfg.horizon,
+        shuffle=False,
+    )
+
+    val_dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        sampler=val_sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True if cfg.device.startswith("cuda") else False,
+    )
     print(f"Total episodes: {dataset.num_episodes}")
 
     device = torch.device(cfg.device)
@@ -69,7 +201,9 @@ def main():
     input_features = {}
     for key, ft in dataset.meta.features.items():
         if key.startswith("observation.image"):
-            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=tuple(ft["shape"]))
+            # Dataset meta stores image shape as (H, W, C), but PolicyFeature expects (C, H, W)
+            shape = (ft["shape"][2], ft["shape"][0], ft["shape"][1])
+            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
         elif key == "observation.state":
             input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=tuple(ft["shape"]))
         elif key == "language_instruction":
@@ -88,6 +222,7 @@ def main():
         n_obs_steps=cfg.n_obs_steps,
         n_action_steps=cfg.n_action_steps,
         noise_scheduler_type=cfg.noise_scheduler_type,
+        num_inference_steps=cfg.num_inference_steps,
     )
 
     policy = DiffusionPolicy(config)
@@ -106,12 +241,29 @@ def main():
     optimizer = optim.AdamW(policy.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
 
-    print(f"\nStarting training for {cfg.num_epochs} epochs on {device}...")
+    num_training_steps = len(train_dataloader) * cfg.num_epochs
+    num_warmup_steps = int(num_training_steps * 0.10)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps
+    )
+    print(f"Created cosine scheduler with {num_warmup_steps} warmup steps and {num_training_steps} total steps.")
 
-    policy.train()
+    if cfg.use_wandb:
+        from dataclasses import asdict
+        wandb.init(project=cfg.wandb_project, config=asdict(cfg), name="diffusion_pusht")
+        print("\nWeights & Biases logging enabled.")
+
+    print(f"\nStarting training for {cfg.num_epochs} epochs on {device}...")
+    best_success_rate = -1.0
+    global_step = 0
+
     for epoch in range(cfg.num_epochs):
-        total_loss = 0.0
-        for batch_idx, batch in enumerate(dataloader):
+        policy.train()
+        total_train_loss = 0.0
+        
+        for batch_idx, batch in enumerate(train_dataloader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             batch = preprocessor(batch)
@@ -131,13 +283,67 @@ def main():
                 loss.backward()
                 optimizer.step()
             
-            total_loss += loss.item()
+            scheduler.step()
+            
+            total_train_loss += loss.item()
+            global_step += 1
             
             if batch_idx % cfg.log_freq == 0:
-                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
+                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
+                if cfg.use_wandb:
+                    wandb.log({"train/step_loss": loss.item(), "global_step": global_step, "train/lr": scheduler.get_last_lr()[0]})
                 
-        avg_loss = total_loss / len(dataloader)
-        print(f"==> Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
+
+        # --- Validation Loop ---
+        policy.eval()
+        total_val_loss = 0.0
+        with torch.no_grad():
+            for val_batch in val_dataloader:
+                val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+                val_batch = preprocessor(val_batch)
+                
+                with torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if cfg.use_amp and cfg.device.startswith("cuda") else contextlib.nullcontext():
+                    v_loss, _ = policy.forward(val_batch)
+                
+                total_val_loss += v_loss.item()
+                
+        avg_val_loss = total_val_loss / len(val_dataloader) if len(val_dataloader) > 0 else 0.0
+        print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
+        
+        if cfg.use_wandb:
+            wandb.log({
+                "train/epoch_loss": avg_train_loss,
+                "val/epoch_loss": avg_val_loss,
+                "epoch": epoch + 1
+            })
+
+        # --- Save Latest Model ---
+        os.makedirs(cfg.save_dir, exist_ok=True)
+        policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
+
+        # --- Evaluation Rollouts ---
+        if (epoch + 1) % cfg.eval_freq == 0 or (epoch + 1) == cfg.num_epochs:
+            print(f"\n--- Running Evaluation Rollouts for {cfg.num_eval_episodes} episodes ---")
+            env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
+            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
+            print(f"==> Epoch {epoch+1} Success Rate: {success_rate * 100:.1f}%")
+            
+            if cfg.use_wandb:
+                eval_metrics = {"eval/success_rate": success_rate, "epoch": epoch + 1}
+                if len(video_frames) > 0:
+                    import numpy as np
+                    # wandb.Video requires shape (time, channel, height, width) in [0, 255]
+                    video_array = np.stack(video_frames)  # (T, H, W, C)
+                    video_array = np.transpose(video_array, (0, 3, 1, 2))  # (T, C, H, W)
+                    eval_metrics["eval/video"] = wandb.Video(video_array, fps=cfg.fps, format="mp4")
+                wandb.log(eval_metrics)
+                
+            if success_rate >= best_success_rate:
+                best_success_rate = success_rate
+                print(f"🌟 New best model! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
+                policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
 
     print("Training complete!")
 

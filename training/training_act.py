@@ -11,30 +11,30 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act import ACTConfig, ACTPolicy
+from transformers import get_cosine_schedule_with_warmup
 
 @dataclass
 class TrainConfig:
     dataset_id: str = "lerobot/pusht"
     action_chunk_size: int = 50
     fps: int = 10
-    batch_size: int = 128
+    batch_size: int = 64
     lr: float = 1e-4
-    weight_decay: float = 1e-3
-    num_epochs: int = 10
-    log_freq: int = 10
+    weight_decay: float = 1e-4
+    num_epochs: int = 40
+    log_freq: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     use_compile: bool = True
     num_workers: int = 4
-    
-    # Eval and Logging based on # of epochs
-    eval_freq: int = 1
-    num_eval_episodes: int = 5
+
+    eval_freq: int = 20          # don't eval every epoch, it's slow
+    num_eval_episodes: int = 20  # more reliable signal
     save_dir: str = "checkpoints/act_pusht"
     use_wandb: bool = True
     wandb_project: str = "pusht-finetune"
 
-def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor):
+def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
     """Run simulation rollouts to evaluate the policy."""
     import imageio
     import numpy as np
@@ -55,6 +55,13 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor):
     with torch.no_grad():
         for ep in range(num_episodes):
             obs, info = env.reset()
+            # Filter initial state to be within dataset distribution [120, 380]
+            # assuming obs[:2] is the agent position.
+            reset_count = 0
+            while (obs[0] < 120 or obs[0] > 380 or obs[1] < 120 or obs[1] > 380) and reset_count < 100:
+                obs, info = env.reset()
+                reset_count += 1
+                
             done = False
             
             # Clear observation history / queues in the policy
@@ -94,7 +101,13 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor):
                 
                 # select_action automatically handles action chunking history internally!
                 action = policy.select_action(batch)
-                action_np = action.squeeze(0).cpu().numpy()
+                
+                # Unnormalize action
+                mean = torch.from_numpy(action_stats['mean']).to(device)
+                std = torch.from_numpy(action_stats['std']).to(device)
+                unnorm_action = action * std + mean
+                
+                action_np = unnorm_action.squeeze(0).cpu().numpy()
                 
                 obs, reward, terminated, truncated, info = env.step(action_np)
                 done = terminated or truncated
@@ -176,7 +189,9 @@ def main():
     input_features = {}
     for key, ft in dataset.meta.features.items():
         if key.startswith("observation.image"):
-            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=tuple(ft["shape"]))
+            # Dataset meta stores image shape as (H, W, C), but PolicyFeature expects (C, H, W)
+            shape = (ft["shape"][2], ft["shape"][0], ft["shape"][1])
+            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
         elif key == "observation.state":
             input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=tuple(ft["shape"]))
         elif key == "language_instruction":
@@ -192,7 +207,9 @@ def main():
         input_features=input_features,
         output_features=output_features,
         chunk_size=cfg.action_chunk_size,
-        n_action_steps=cfg.action_chunk_size,
+        n_action_steps=cfg.action_chunk_size,  # Must be 1 when using temporal ensembling
+        # temporal_ensemble_coeff=0.01,
+        kl_weight=10,
     )
 
     policy = ACTPolicy(config)
@@ -211,6 +228,15 @@ def main():
     optimizer = optim.AdamW(policy.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
+
+    num_training_steps = len(train_dataloader) * cfg.num_epochs
+    num_warmup_steps = int(num_training_steps * 0.10)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps
+    )
+    print(f"Created cosine scheduler with {num_warmup_steps} warmup steps and {num_training_steps} total steps.")
 
     if cfg.use_wandb:
         # We can pass the dataclass fields directly into wandb config
@@ -248,13 +274,15 @@ def main():
                 loss.backward()
                 optimizer.step()
             
+            scheduler.step()
+            
             total_train_loss += loss.item()
             global_step += 1
             
             if batch_idx % cfg.log_freq == 0:
                 print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
                 if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "global_step": global_step})
+                    wandb.log({"train/step_loss": loss.item(), "global_step": global_step, "train/lr": scheduler.get_last_lr()[0]})
                 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
@@ -307,7 +335,7 @@ def main():
             # We map dataset ID to gym env ID if needed, e.g. lerobot/pusht -> gym_pusht/PushT-v0
             env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
             
-            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor)
+            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
             print(f"Evaluation Success Rate: {success_rate * 100:.1f}%")
             
             if cfg.use_wandb:
