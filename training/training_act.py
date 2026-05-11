@@ -27,8 +27,8 @@ class TrainConfig:
     use_compile: bool = True
     num_workers: int = 4
     
-    # Eval and Logging
-    eval_freq: int = 5
+    # Eval and Logging based on # of epochs
+    eval_freq: int = 1
     num_eval_episodes: int = 5
     save_dir: str = "checkpoints/act_pusht"
     use_wandb: bool = True
@@ -304,6 +304,8 @@ def main():
     if cfg.use_wandb:
         wandb.finish()
     print("\nTraining complete!")
+    print("Pushing model to hub")
+    policy.push_to_hub("NLTuan/act-pusht-policy")
 
 if __name__ == "__main__":
     main()
