@@ -14,7 +14,7 @@ class TrainConfig:
     dataset_id: str = "lerobot/pusht"
     action_chunk_size: int = 50
     fps: int = 10
-    batch_size: int = 32
+    batch_size: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-4
     num_epochs: int = 5
