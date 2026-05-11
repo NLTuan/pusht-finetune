@@ -254,9 +254,15 @@ def main():
                 if cfg.use_amp and cfg.device.startswith("cuda"):
                     pt_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                     with torch.amp.autocast(device_type="cuda", dtype=pt_dtype):
-                        v_loss, _ = policy.forward(val_batch)
+                        actions_hat, _ = policy.model(val_batch)
+                        abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
+                        valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
+                        v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
                 else:
-                    v_loss, _ = policy.forward(val_batch)
+                    actions_hat, _ = policy.model(val_batch)
+                    abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
+                    valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
+                    v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
                     
                 total_val_loss += v_loss.item()
                 
