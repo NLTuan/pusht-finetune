@@ -18,8 +18,8 @@ class TrainConfig:
     fps: int = 10
     batch_size: int = 32
     lr: float = 1e-4
-    weight_decay: float = 1e-4
-    num_epochs: int = 5
+    weight_decay: float = 1e-3
+    num_epochs: int = 10
     log_freq: int = 10
     noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

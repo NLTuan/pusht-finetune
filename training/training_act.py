@@ -17,10 +17,10 @@ class TrainConfig:
     dataset_id: str = "lerobot/pusht"
     action_chunk_size: int = 50
     fps: int = 10
-    batch_size: int = 32
+    batch_size: int = 128
     lr: float = 1e-4
-    weight_decay: float = 1e-4
-    num_epochs: int = 5
+    weight_decay: float = 1e-3
+    num_epochs: int = 10
     log_freq: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
@@ -34,12 +34,13 @@ class TrainConfig:
     use_wandb: bool = True
     wandb_project: str = "pusht-finetune"
 
-def rollout_and_evaluate(policy, env_id, num_episodes, device):
+def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor):
     """Run simulation rollouts to evaluate the policy."""
     import imageio
     import numpy as np
     
     # NOTE: You may need to import your specific env registration here (e.g., import gym_pusht)
+    import gym_pusht
     try:
         env = gym.make(env_id, render_mode="rgb_array")
     except gym.error.NameNotFound:
@@ -52,7 +53,7 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device):
     best_video_frames = []
     
     with torch.no_grad():
-        for ep in range(num_eval_episodes=num_episodes):
+        for ep in range(num_episodes):
             obs, info = env.reset()
             done = False
             
@@ -62,17 +63,36 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device):
                 
             ep_frames = []
             
+            frame = env.render()
+            if frame is not None:
+                ep_frames.append(frame)
+                
             # We assume a max step limit if the env doesn't truncate
             step_count = 0
             while not done and step_count < 1000:
                 batch = {}
-                for k, v in obs.items():
-                    if k in policy.config.input_features:
-                        # Convert numpy to tensor, add batch dimension, move to device
-                        t = torch.from_numpy(np.array(v)).float().to(device).unsqueeze(0)
-                        batch[k] = t
                 
-                # select_action automatically handles normalization and action chunking history internally!
+                # Handle images
+                if "observation.image" in policy.config.input_features:
+                    import torchvision.transforms as T
+                    transform = T.Compose([
+                        T.ToPILImage(),
+                        T.Resize((96, 96)),
+                        T.ToTensor(),
+                    ])
+                    img_tensor = transform(frame).to(device).unsqueeze(0)
+                    batch["observation.image"] = img_tensor
+                
+                # Handle state
+                if "observation.state" in policy.config.input_features:
+                    # Assume first 2 dims are agent pos
+                    state_tensor = torch.from_numpy(obs[:2]).float().to(device).unsqueeze(0)
+                    batch["observation.state"] = state_tensor
+                
+                # Preprocess (normalize)
+                batch = preprocessor(batch)
+                
+                # select_action automatically handles action chunking history internally!
                 action = policy.select_action(batch)
                 action_np = action.squeeze(0).cpu().numpy()
                 
@@ -80,7 +100,7 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device):
                 done = terminated or truncated
                 step_count += 1
                 
-                # Render frame for video
+                # Render frame for video and next step
                 frame = env.render()
                 if frame is not None:
                     ep_frames.append(frame)
@@ -254,12 +274,12 @@ def main():
                 if cfg.use_amp and cfg.device.startswith("cuda"):
                     pt_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                     with torch.amp.autocast(device_type="cuda", dtype=pt_dtype):
-                        actions_hat, _ = policy.model(val_batch)
+                        actions_hat = policy.predict_action_chunk(val_batch)
                         abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
                         valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
                         v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
                 else:
-                    actions_hat, _ = policy.model(val_batch)
+                    actions_hat = policy.predict_action_chunk(val_batch)
                     abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
                     valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
                     v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
@@ -287,7 +307,7 @@ def main():
             # We map dataset ID to gym env ID if needed, e.g. lerobot/pusht -> gym_pusht/PushT-v0
             env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
             
-            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device)
+            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor)
             print(f"Evaluation Success Rate: {success_rate * 100:.1f}%")
             
             if cfg.use_wandb:
