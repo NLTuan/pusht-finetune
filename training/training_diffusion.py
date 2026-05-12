@@ -58,6 +58,8 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
 
     policy.eval()
     successes = []
+    ever_successes = []
+    max_coverages = []
     best_video_frames = []
     
     with torch.no_grad():
@@ -71,6 +73,8 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
                 reset_count += 1
                 
             done = False
+            ever_succeeded = False
+            current_max_coverage = 0.0
             
             # Clear observation history / queues in the policy
             if hasattr(policy, "reset"):
@@ -118,6 +122,9 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
                 action_np = unnorm_action.squeeze(0).cpu().numpy()
                 
                 obs, reward, terminated, truncated, info = env.step(action_np)
+                current_max_coverage = max(current_max_coverage, reward)
+                if reward > 0.9 or info.get("is_success", False) or info.get("success", False):
+                    ever_succeeded = True
                 done = terminated or truncated
                 step_count += 1
                 
@@ -128,6 +135,8 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
             
             is_success = info.get("is_success", False) or info.get("success", False) or reward > 0.9
             successes.append(1.0 if is_success else 0.0)
+            ever_successes.append(1.0 if ever_succeeded else 0.0)
+            max_coverages.append(current_max_coverage)
             
             # Save the video of the first successful rollout (or the last rollout if none succeed)
             if len(best_video_frames) == 0 or (is_success and sum(successes) == 1):
@@ -135,8 +144,10 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
                 
     env.close()
     policy.train()
-    success_rate = sum(successes) / num_episodes
-    return success_rate, best_video_frames
+    terminal_success_rate = sum(successes) / num_episodes
+    ever_success_rate = sum(ever_successes) / num_episodes
+    avg_max_coverage = sum(max_coverages) / num_episodes
+    return terminal_success_rate, ever_success_rate, avg_max_coverage, best_video_frames
 
 def main():
     cfg = TrainConfig()
@@ -346,11 +357,16 @@ def main():
         if (epoch + 1) % cfg.eval_freq == 0 or (epoch + 1) == cfg.num_epochs:
             print(f"\n--- Running Evaluation Rollouts for {cfg.num_eval_episodes} episodes ---")
             env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
-            success_rate, video_frames = rollout_and_evaluate(ema_policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
-            print(f"==> Epoch {epoch+1} Success Rate: {success_rate * 100:.1f}%")
+            success_rate, ever_success_rate, avg_max_coverage, video_frames = rollout_and_evaluate(ema_policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
+            print(f"==> Epoch {epoch+1} Terminal Success Rate: {success_rate * 100:.1f}%, Ever Success Rate: {ever_success_rate * 100:.1f}%, Avg Max Coverage: {avg_max_coverage:.4f}")
             
             if cfg.use_wandb:
-                eval_metrics = {"eval/success_rate": success_rate, "epoch": epoch + 1}
+                eval_metrics = {
+                    "eval/success_rate": success_rate, 
+                    "eval/ever_success_rate": ever_success_rate, 
+                    "eval/avg_max_coverage": avg_max_coverage,
+                    "epoch": epoch + 1
+                }
                 if len(video_frames) > 0:
                     import numpy as np
                     # wandb.Video requires shape (time, channel, height, width) in [0, 255]
