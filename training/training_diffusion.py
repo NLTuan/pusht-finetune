@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.optim as optim
+import copy
 from torch.utils.data import DataLoader
 import wandb
 import gymnasium as gym
@@ -14,6 +15,7 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionConfig, DiffusionPolicy
 from transformers import get_cosine_schedule_with_warmup
+from torchvision.transforms import v2
 
 @dataclass
 class TrainConfig:
@@ -24,8 +26,8 @@ class TrainConfig:
     fps: int = 10
     batch_size: int = 64
     lr: float = 1e-4
-    weight_decay: float = 1e-6
-    num_epochs: int = 500
+    weight_decay: float = 1e-4
+    num_epochs: int = 800
     log_freq: int = 50
     noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -233,6 +235,10 @@ def main():
     policy = DiffusionPolicy(config)
     policy.to(device)
 
+    print("\nCreating EMA policy...")
+    ema_policy = copy.deepcopy(policy)
+    ema_decay = 0.999
+
     if cfg.use_compile and cfg.device.startswith("cuda"):
         print("\nCompiling policy with torch.compile()...")
         policy = torch.compile(policy)
@@ -271,8 +277,6 @@ def main():
         for batch_idx, batch in enumerate(train_dataloader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-
-            
             batch = preprocessor(batch)
             
             optimizer.zero_grad(set_to_none=True)
@@ -283,14 +287,22 @@ def main():
                     loss, output_dict = policy.forward(batch)
                 
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss, output_dict = policy.forward(batch)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 optimizer.step()
             
             scheduler.step()
+            
+            # Update EMA policy
+            with torch.no_grad():
+                for p, p_ema in zip(policy.parameters(), ema_policy.parameters()):
+                    p_ema.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
             
             total_train_loss += loss.item()
             global_step += 1
@@ -312,7 +324,7 @@ def main():
                 val_batch = preprocessor(val_batch)
                 
                 with torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if cfg.use_amp and cfg.device.startswith("cuda") else contextlib.nullcontext():
-                    v_loss, _ = policy.forward(val_batch)
+                    v_loss, _ = ema_policy.forward(val_batch)
                 
                 total_val_loss += v_loss.item()
                 
@@ -328,13 +340,13 @@ def main():
 
         # --- Save Latest Model ---
         os.makedirs(cfg.save_dir, exist_ok=True)
-        policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
+        ema_policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
 
         # --- Evaluation Rollouts ---
         if (epoch + 1) % cfg.eval_freq == 0 or (epoch + 1) == cfg.num_epochs:
             print(f"\n--- Running Evaluation Rollouts for {cfg.num_eval_episodes} episodes ---")
             env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
-            success_rate, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
+            success_rate, video_frames = rollout_and_evaluate(ema_policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
             print(f"==> Epoch {epoch+1} Success Rate: {success_rate * 100:.1f}%")
             
             if cfg.use_wandb:
@@ -350,7 +362,7 @@ def main():
             if success_rate >= best_success_rate:
                 best_success_rate = success_rate
                 print(f"🌟 New best model! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
-                policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                ema_policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
 
     print("Training complete!")
 
