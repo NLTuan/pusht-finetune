@@ -19,9 +19,9 @@ class TrainConfig:
     action_chunk_size: int = 50
     fps: int = 10
     batch_size: int = 64
-    lr: float = 1e-4
+    lr: float = 1e-3
     weight_decay: float = 1e-4
-    num_epochs: int = 40
+    num_epochs: int = 100
     log_freq: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True

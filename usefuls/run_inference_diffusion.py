@@ -86,10 +86,10 @@ def main():
                 
                 action = policy.select_action(batch)
                 
-                # Unnormalize action
-                mean = torch.from_numpy(dataset.meta.stats['action']['mean']).to(device)
-                std = torch.from_numpy(dataset.meta.stats['action']['std']).to(device)
-                unnorm_action = action * std + mean
+                # Unnormalize action (MIN_MAX)
+                min_val = torch.from_numpy(dataset.meta.stats['action']['min']).to(device)
+                max_val = torch.from_numpy(dataset.meta.stats['action']['max']).to(device)
+                unnorm_action = (action + 1) / 2 * (max_val - min_val) + min_val
                 
                 action_np = unnorm_action.squeeze(0).cpu().numpy()
                 

@@ -24,10 +24,10 @@ class TrainConfig:
     fps: int = 10
     batch_size: int = 64
     lr: float = 1e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-6
     num_epochs: int = 200
     log_freq: int = 50
-    noise_scheduler_type: str = "DDIM"  # Options: "DDPM", "DDIM"
+    noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     use_compile: bool = True
@@ -108,10 +108,10 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
                 # select_action automatically handles action chunking history internally!
                 action = policy.select_action(batch)
                 
-                # Unnormalize action
-                mean = torch.from_numpy(action_stats['mean']).to(device)
-                std = torch.from_numpy(action_stats['std']).to(device)
-                unnorm_action = action * std + mean
+                # Unnormalize action (MIN_MAX)
+                min_val = torch.from_numpy(action_stats['min']).to(device)
+                max_val = torch.from_numpy(action_stats['max']).to(device)
+                unnorm_action = (action + 1) / 2 * (max_val - min_val) + min_val
                 
                 action_np = unnorm_action.squeeze(0).cpu().numpy()
                 
@@ -223,6 +223,10 @@ def main():
         n_action_steps=cfg.n_action_steps,
         noise_scheduler_type=cfg.noise_scheduler_type,
         num_inference_steps=cfg.num_inference_steps,
+        resize_shape=(96, 96),
+        crop_shape=(84, 84),
+        crop_is_random=True,
+        use_group_norm=True,
     )
 
     policy = DiffusionPolicy(config)
@@ -265,6 +269,8 @@ def main():
         
         for batch_idx, batch in enumerate(train_dataloader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+
             
             batch = preprocessor(batch)
             
