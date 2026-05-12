@@ -25,7 +25,7 @@ class TrainConfig:
     batch_size: int = 64
     lr: float = 1e-4
     weight_decay: float = 1e-6
-    num_epochs: int = 200
+    num_epochs: int = 500
     log_freq: int = 50
     noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,12 +33,12 @@ class TrainConfig:
     use_compile: bool = True
     num_workers: int = 4
     
-    eval_freq: int = 20
-    num_eval_episodes: int = 20
-    num_inference_steps: int = 10
+    eval_freq: int = 50
+    num_eval_episodes: int = 10
+    num_inference_steps: int = 100
     save_dir: str = "checkpoints/diffusion_pusht"
     use_wandb: bool = True
-    wandb_project: str = "pusht-finetune"
+    wandb_project: str = "pusht-finetune-diffusion"
 
 def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
     """Run simulation rollouts to evaluate the policy."""
@@ -227,6 +227,7 @@ def main():
         crop_shape=(84, 84),
         crop_is_random=True,
         use_group_norm=True,
+        pretrained_backbone_weights=None,
     )
 
     policy = DiffusionPolicy(config)
@@ -297,7 +298,7 @@ def main():
             if batch_idx % cfg.log_freq == 0:
                 print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
                 if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "global_step": global_step, "train/lr": scheduler.get_last_lr()[0]})
+                    wandb.log({"train/step_loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=global_step)
                 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
@@ -323,7 +324,7 @@ def main():
                 "train/epoch_loss": avg_train_loss,
                 "val/epoch_loss": avg_val_loss,
                 "epoch": epoch + 1
-            })
+            }, step=global_step)
 
         # --- Save Latest Model ---
         os.makedirs(cfg.save_dir, exist_ok=True)
@@ -344,7 +345,7 @@ def main():
                     video_array = np.stack(video_frames)  # (T, H, W, C)
                     video_array = np.transpose(video_array, (0, 3, 1, 2))  # (T, C, H, W)
                     eval_metrics["eval/video"] = wandb.Video(video_array, fps=cfg.fps, format="mp4")
-                wandb.log(eval_metrics)
+                wandb.log(eval_metrics, step=global_step)
                 
             if success_rate >= best_success_rate:
                 best_success_rate = success_rate

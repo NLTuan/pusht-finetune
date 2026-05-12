@@ -19,7 +19,7 @@ class TrainConfig:
     action_chunk_size: int = 50
     fps: int = 10
     batch_size: int = 64
-    lr: float = 1e-3
+    lr: float = 1e-5
     weight_decay: float = 1e-4
     num_epochs: int = 100
     log_freq: int = 50
@@ -256,6 +256,20 @@ def main():
             # Move batch to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
+            # Data Augmentation for images (to prevent overfitting)
+            if "observation.image" in batch:
+                import torchvision.transforms as T
+                aug = T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02)
+                img = batch["observation.image"]
+                shape = img.shape
+                if len(shape) == 5: # (B, T, C, H, W)
+                    B, T_dim, C, H, W = shape
+                    img_flattened = img.view(B * T_dim, C, H, W)
+                    img_augmented = aug(img_flattened)
+                    batch["observation.image"] = img_augmented.view(B, T_dim, C, H, W)
+                elif len(shape) == 4: # (B, C, H, W)
+                    batch["observation.image"] = aug(img)
+            
             # Preprocess batch (normalize)
             batch = preprocessor(batch)
             
@@ -282,12 +296,12 @@ def main():
             if batch_idx % cfg.log_freq == 0:
                 print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
                 if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "global_step": global_step, "train/lr": scheduler.get_last_lr()[0]})
+                    wandb.log({"train/step_loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=global_step)
                 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
         if cfg.use_wandb:
-            wandb.log({"train/epoch_loss": avg_train_loss, "epoch": epoch})
+            wandb.log({"train/epoch_loss": avg_train_loss, "epoch": epoch}, step=global_step)
             
         # ==========================================
         # OFFLINE VALIDATION (Loss on val split)
@@ -317,7 +331,7 @@ def main():
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
         if cfg.use_wandb:
-            wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch})
+            wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
             
         policy.train() # Set back to train mode
 
@@ -347,7 +361,7 @@ def main():
                     vid_tensor = np.array(video_frames).transpose(0, 3, 1, 2)
                     eval_metrics["eval/rollout_video"] = wandb.Video(vid_tensor, fps=cfg.fps, format="mp4")
                     
-                wandb.log(eval_metrics)
+                wandb.log(eval_metrics, step=global_step)
             
             # Save best model
             if success_rate >= best_success_rate:
