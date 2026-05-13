@@ -14,7 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run inference using a trained Diffusion policy.")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/diffusion_pusht/best_model")
     parser.add_argument("--dataset_id", type=str, default="lerobot/pusht")
-    parser.add_argument("--num_episodes", type=int, default=1)
+    parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--output_video", type=str, default="inference_diffusion.mp4")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -45,6 +45,8 @@ def main():
         return
 
     successes = []
+    ever_successes = []
+    max_coverages = []
     best_video_frames = []
 
     with torch.no_grad():
@@ -56,6 +58,8 @@ def main():
                 reset_count += 1
                 
             done = False
+            ever_succeeded = False
+            current_max_coverage = 0.0
             if hasattr(policy, "reset"):
                 policy.reset()
                 
@@ -94,6 +98,9 @@ def main():
                 action_np = unnorm_action.squeeze(0).cpu().numpy()
                 
                 obs, reward, terminated, truncated, info = env.step(action_np)
+                current_max_coverage = max(current_max_coverage, reward)
+                if reward > 0.9 or info.get("is_success", False) or info.get("success", False):
+                    ever_succeeded = True
                 done = terminated or truncated
                 step_count += 1
                 
@@ -103,14 +110,18 @@ def main():
             
             is_success = info.get("is_success", False) or info.get("success", False) or reward > 0.9
             successes.append(1.0 if is_success else 0.0)
-            print(f"Episode {ep+1} finished after {step_count} steps. Success: {is_success}")
+            ever_successes.append(1.0 if ever_succeeded else 0.0)
+            max_coverages.append(current_max_coverage)
+            print(f"Episode {ep+1} finished after {step_count} steps. Success: {is_success}, Ever Success: {ever_succeeded}, Max Coverage: {current_max_coverage:.4f}")
             
             if len(best_video_frames) == 0 or (is_success and sum(successes) == 1):
                 best_video_frames = ep_frames
 
     env.close()
     
-    print(f"\nFinal Success Rate: {sum(successes)/args.num_episodes * 100:.1f}%")
+    print(f"\nFinal Terminal Success Rate: {sum(successes)/args.num_episodes * 100:.1f}%")
+    print(f"Final Ever Success Rate: {sum(ever_successes)/args.num_episodes * 100:.1f}%")
+    print(f"Final Avg Max Coverage: {sum(max_coverages)/args.num_episodes:.4f}")
     
     if best_video_frames:
         print(f"Saving video of rollout to {args.output_video}...")

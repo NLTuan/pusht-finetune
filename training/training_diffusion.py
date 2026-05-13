@@ -26,7 +26,7 @@ class TrainConfig:
     fps: int = 10
     batch_size: int = 64
     lr: float = 1e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-5
     num_epochs: int = 800
     log_freq: int = 50
     noise_scheduler_type: str = "DDPM"  # Options: "DDPM", "DDIM"
