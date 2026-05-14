@@ -9,14 +9,15 @@ dependencies = [
     "imageio>=2.37.3",
     "lerobot[training,viz,smolvla,diffusion,pusht,pi]",
     "moviepy>=2.2.1",
-    "nvidia-cudnn-cu12>=9.22.0.52",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
+    "torchcodec==0.4",
     "wandb>=0.24.0,<0.25.0",
 ]
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu121"
