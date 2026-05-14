@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader
 import wandb
 import gymnasium as gym
 from dataclasses import dataclass
+from huggingface_hub import HfApi, model_info
+from huggingface_hub.utils import RevisionNotFoundError
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -15,7 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 @dataclass
 class TrainConfig:
-    dataset_id: str = "lerobot/pusht"
+    dataset_id: str = "NLTuan/red_blue_cleaned_extra"
     action_chunk_size: int = 50
     fps: int = 10
     batch_size: int = 64
@@ -30,9 +32,10 @@ class TrainConfig:
 
     eval_freq: int = 20          # don't eval every epoch, it's slow
     num_eval_episodes: int = 20  # more reliable signal
-    save_dir: str = "checkpoints/act_pusht"
+    run_eval: bool = False       # set to False for real-life data with no simulator
+    save_dir: str = "checkpoints/act_red_blue"
     use_wandb: bool = True
-    wandb_project: str = "pusht-finetune"
+    wandb_project: str = "red-blue-act"
 
 def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
     """Run simulation rollouts to evaluate the policy."""
@@ -252,12 +255,13 @@ def main():
     if cfg.use_wandb:
         # We can pass the dataclass fields directly into wandb config
         from dataclasses import asdict
-        wandb.init(project=cfg.wandb_project, config=asdict(cfg), name="act_pusht")
+        wandb.init(project=cfg.wandb_project, config=asdict(cfg), name="act_red_blue")
         print("\nWeights & Biases logging enabled.")
 
     print(f"\nStarting training for {cfg.num_epochs} epochs on {device}...")
 
     best_success_rate = -1.0
+    best_val_loss = float('inf')
     global_step = 0
 
     policy.train()
@@ -347,6 +351,12 @@ def main():
         if cfg.use_wandb:
             wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
             
+        # Save best model based on validation loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            print(f"🌟 New best model based on Val Loss! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
+            policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+            
         policy.train() # Set back to train mode
 
         # ==========================================
@@ -357,7 +367,7 @@ def main():
         policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
         
         # Run online evaluation
-        if (epoch + 1) % cfg.eval_freq == 0:
+        if cfg.run_eval and (epoch + 1) % cfg.eval_freq == 0:
             print(f"\n--- Running Evaluation Rollouts for {cfg.num_eval_episodes} episodes ---")
             
             # We map dataset ID to gym env ID if needed, e.g. lerobot/pusht -> gym_pusht/PushT-v0
@@ -391,8 +401,35 @@ def main():
     if cfg.use_wandb:
         wandb.finish()
     print("\nTraining complete!")
-    print("Pushing model to hub")
-    policy.push_to_hub("NLTuan/act-pusht-policy")
+    
+    api = HfApi()
+    repo_id = "NLTuan/act-red-blue-policy"
+    
+    # Push best model to main branch
+    print(f"Pushing best model to {repo_id} (branch: main)...")
+    api.upload_folder(
+        folder_path=os.path.join(cfg.save_dir, "best_model"),
+        repo_id=repo_id,
+        revision="main",
+    )
+    
+    # Create 'latest' branch if it doesn't exist
+    print(f"Checking if 'latest' branch exists for {repo_id}...")
+    try:
+        model_info(repo_id, revision="latest")
+        print("'latest' branch already exists.")
+    except RevisionNotFoundError:
+        print("Creating 'latest' branch...")
+        api.create_branch(repo_id, branch="latest")
+        print("Created 'latest' branch.")
+        
+    # Push latest model to latest branch
+    print(f"Pushing latest model to {repo_id} (branch: latest)...")
+    api.upload_folder(
+        folder_path=os.path.join(cfg.save_dir, "latest_model"),
+        repo_id=repo_id,
+        revision="latest",
+    )
 
 if __name__ == "__main__":
     main()
