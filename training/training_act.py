@@ -22,9 +22,9 @@ class TrainConfig:
     action_chunk_size: int = 50
     fps: int = 10
     batch_size: int = 8
-    lr: float = 1e-5
+    lr: float = 1e-4
     weight_decay: float = 1e-4
-    num_epochs: int = 50
+    num_epochs: int = 20
     log_freq: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
@@ -246,7 +246,7 @@ def main():
     scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
 
     num_training_steps = len(train_dataloader) * cfg.num_epochs
-    num_warmup_steps = int(num_training_steps * 0.2)
+    num_warmup_steps = int(num_training_steps * 0.02)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
@@ -300,13 +300,13 @@ def main():
                 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss, output_dict = policy.forward(batch)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 optimizer.step()
             
             scheduler.step()
@@ -315,9 +315,10 @@ def main():
             global_step += 1
             
             if batch_idx % cfg.log_freq == 0:
-                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
+                grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}, Grad Norm: {grad_norm_val:.4f}")
                 if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "train/lr": scheduler.get_last_lr()[0], "train/elapsed_time": time.time() - start_time}, step=global_step)
+                    wandb.log({"train/step_loss": loss.item(), "train/grad_norm": grad_norm_val, "train/lr": scheduler.get_last_lr()[0], "train/elapsed_time": time.time() - start_time}, step=global_step)
                 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
