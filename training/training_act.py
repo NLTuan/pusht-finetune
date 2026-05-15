@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.optim as optim
+from contextlib import nullcontext
 from torch.utils.data import DataLoader
 import wandb
 import gymnasium as gym
@@ -23,7 +24,7 @@ class TrainConfig:
     action_chunk_size: int = 50
     fps: int = 10
     batch_size: int = 8
-    lr: float = 1e-4
+    lr: float = 5e-5
     weight_decay: float = 1e-4
     num_epochs: int = 20
     log_freq: int = 50
@@ -59,7 +60,20 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
     ever_successes = []
     max_coverages = []
     best_video_frames = []
-    
+
+    # Hoist these out of the inner loop — they are constant for the entire rollout.
+    input_features = policy.config.input_features
+    has_image = "observation.image" in input_features
+    has_state = "observation.state" in input_features
+
+    if has_image:
+        import torchvision.transforms as T
+        transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((96, 96)),
+            T.ToTensor(),
+        ])
+
     with torch.no_grad():
         for ep in range(num_episodes):
             obs, info = env.reset()
@@ -89,19 +103,11 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
             while not done and step_count < 1000:
                 batch = {}
                 
-                # Handle images
-                if "observation.image" in policy.config.input_features:
-                    import torchvision.transforms as T
-                    transform = T.Compose([
-                        T.ToPILImage(),
-                        T.Resize((96, 96)),
-                        T.ToTensor(),
-                    ])
+                if has_image:
                     img_tensor = transform(frame).to(device).unsqueeze(0)
                     batch["observation.image"] = img_tensor
                 
-                # Handle state
-                if "observation.state" in policy.config.input_features:
+                if has_state:
                     # Assume first 2 dims are agent pos
                     state_tensor = torch.from_numpy(obs[:2]).float().to(device).unsqueeze(0)
                     batch["observation.state"] = state_tensor
@@ -175,6 +181,7 @@ def main():
         sampler=train_sampler,
         num_workers=cfg.num_workers,
         pin_memory=True if cfg.device.startswith("cuda") else False,
+        persistent_workers=cfg.num_workers > 0,
     )
 
     # Validation Sampler (Episodes val_split_idx to end)
@@ -191,6 +198,7 @@ def main():
         sampler=val_sampler,
         num_workers=cfg.num_workers,
         pin_memory=True if cfg.device.startswith("cuda") else False,
+        persistent_workers=cfg.num_workers > 0,
     )
 
     device = torch.device(cfg.device)
@@ -243,7 +251,10 @@ def main():
 
     optimizer = optim.AdamW(policy.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
+    use_amp_cuda = cfg.use_amp and cfg.device.startswith("cuda")
+    scaler = torch.amp.GradScaler(device='cuda') if use_amp_cuda else None
+    # Resolve AMP dtype once — avoids repeated torch.cuda.is_bf16_supported() calls in the loop
+    pt_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if use_amp_cuda else None
 
     num_training_steps = len(train_dataloader) * cfg.num_epochs
     num_warmup_steps = int(num_training_steps * 0.02)
@@ -265,11 +276,22 @@ def main():
     best_success_rate = -1.0
     best_val_loss = float('inf')
     global_step = 0
+    # start_time kept for reference; per-epoch timing used for throughput metric
     start_time = time.time()
 
     policy.train()
     for epoch in range(cfg.num_epochs):
-        total_train_loss = 0.0
+        # All accumulators stay on GPU — zero CPU-GPU syncs during the epoch.
+        total_train_loss = torch.zeros(1, device=device)
+        total_grad_norm = torch.zeros(1, device=device)
+        
+        # Accumulators for the logging interval (averages over log_freq steps)
+        interval_loss = torch.zeros(1, device=device)
+        interval_grad_norm = torch.zeros(1, device=device)
+        interval_count = 0
+        
+        epoch_start_time = time.time()
+        interval_start_time = time.time()
         for batch_idx, batch in enumerate(train_dataloader):
             # Move batch to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -280,8 +302,7 @@ def main():
             
             optimizer.zero_grad(set_to_none=True) # Faster than zero_grad()
             
-            if cfg.use_amp and cfg.device.startswith("cuda"):
-                pt_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            if use_amp_cuda:
                 with torch.amp.autocast(device_type="cuda", dtype=pt_dtype):
                     loss, output_dict = policy.forward(batch)
                 
@@ -298,46 +319,67 @@ def main():
             
             scheduler.step()
             
-            total_train_loss += loss.item()
+            detached_loss = loss.detach()
+            detached_grad_norm = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm, device=device)
+            
+            total_train_loss += detached_loss
+            total_grad_norm += detached_grad_norm
+            
+            interval_loss += detached_loss
+            interval_grad_norm += detached_grad_norm
+            interval_count += 1
             global_step += 1
             
             if batch_idx % cfg.log_freq == 0:
-                grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}, Grad Norm: {grad_norm_val:.4f}")
-                if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "train/grad_norm": grad_norm_val, "train/lr": scheduler.get_last_lr()[0], "train/elapsed_time": time.time() - start_time}, step=global_step)
+                # One sync per log_freq steps — pulls the average of the last interval.
+                avg_step_loss = (interval_loss / interval_count).item()
+                avg_step_grad_norm = (interval_grad_norm / interval_count).item()
                 
-        avg_train_loss = total_train_loss / len(train_dataloader)
-        print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
+                # Calculate interval batches per second
+                current_time = time.time()
+                interval_duration = current_time - interval_start_time
+                interval_bps = interval_count / interval_duration if interval_duration > 0 else 0.0
+                
+                print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Avg Loss: {avg_step_loss:.4f}, Avg Grad Norm: {avg_step_grad_norm:.4f}, {interval_bps:.1f} b/s")
+                if cfg.use_wandb:
+                    wandb.log({"train/step_loss": avg_step_loss, "train/step_grad_norm": avg_step_grad_norm, "train/lr": scheduler.get_last_lr()[0], "train/step_batches_per_sec": interval_bps}, step=global_step)
+                
+                # Reset interval accumulators
+                interval_loss.zero_()
+                interval_grad_norm.zero_()
+                interval_count = 0
+                interval_start_time = time.time()
+            
+        # Single sync per epoch: pull all epoch averages to CPU at once.
+        n = len(train_dataloader)
+        avg_train_loss = (total_train_loss / n).item()
+        avg_grad_norm  = (total_grad_norm  / n).item()
+        avg_lr = scheduler.get_last_lr()[0]
+        batches_per_sec = n / (time.time() - epoch_start_time)
+        print(f"==> Epoch {epoch+1} | Loss: {avg_train_loss:.4f} | Grad Norm: {avg_grad_norm:.4f} | LR: {avg_lr:.2e} | {batches_per_sec:.1f} batches/s")
         if cfg.use_wandb:
-            wandb.log({"train/epoch_loss": avg_train_loss, "epoch": epoch}, step=global_step)
+            wandb.log({"train/epoch_loss": avg_train_loss, "train/avg_grad_norm": avg_grad_norm, "train/lr": avg_lr, "train/batches_per_sec": batches_per_sec, "epoch": epoch}, step=global_step)
             
         # ==========================================
         # OFFLINE VALIDATION (Loss on val split)
         # ==========================================
         policy.eval()
-        total_val_loss = 0.0
+        total_val_loss = torch.zeros(1, device=device)
+        amp_ctx = torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if use_amp_cuda else nullcontext()
         with torch.no_grad():
             for val_batch in val_dataloader:
                 val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
                 val_batch = preprocessor(val_batch)
                 
-                if cfg.use_amp and cfg.device.startswith("cuda"):
-                    pt_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                    with torch.amp.autocast(device_type="cuda", dtype=pt_dtype):
-                        actions_hat = policy.predict_action_chunk(val_batch)
-                        abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
-                        valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
-                        v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
-                else:
+                with amp_ctx:
                     actions_hat = policy.predict_action_chunk(val_batch)
                     abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
                     valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
                     v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
                     
-                total_val_loss += v_loss.item()
+                total_val_loss += v_loss.detach()
                 
-        avg_val_loss = total_val_loss / len(val_dataloader)
+        avg_val_loss = (total_val_loss / len(val_dataloader)).item()  # single sync
         print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
         if cfg.use_wandb:
             wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
