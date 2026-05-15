@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import wandb
 import gymnasium as gym
 from dataclasses import dataclass
+import time
 from huggingface_hub import HfApi, model_info
 from huggingface_hub.utils import RevisionNotFoundError
 
@@ -20,10 +21,10 @@ class TrainConfig:
     dataset_id: str = "NLTuan/red_blue_cleaned_extra"
     action_chunk_size: int = 50
     fps: int = 10
-    batch_size: int = 64
+    batch_size: int = 8
     lr: float = 1e-5
     weight_decay: float = 1e-4
-    num_epochs: int = 300
+    num_epochs: int = 50
     log_freq: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
@@ -36,6 +37,7 @@ class TrainConfig:
     save_dir: str = "checkpoints/act_red_blue"
     use_wandb: bool = True
     wandb_project: str = "red-blue-act"
+    hub_repo_id: str = "NLTuan/act-red-blue-policy"
 
 def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
     """Run simulation rollouts to evaluate the policy."""
@@ -244,7 +246,7 @@ def main():
     scaler = torch.amp.GradScaler(device='cuda') if cfg.use_amp and cfg.device.startswith("cuda") else None
 
     num_training_steps = len(train_dataloader) * cfg.num_epochs
-    num_warmup_steps = int(num_training_steps * 0.10)
+    num_warmup_steps = int(num_training_steps * 0.2)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
@@ -255,7 +257,7 @@ def main():
     if cfg.use_wandb:
         # We can pass the dataclass fields directly into wandb config
         from dataclasses import asdict
-        wandb.init(project=cfg.wandb_project, config=asdict(cfg), name="act_red_blue")
+        wandb.init(project=cfg.wandb_project, config=asdict(cfg), name=f"act_red_blue_lr{cfg.lr}")
         print("\nWeights & Biases logging enabled.")
 
     print(f"\nStarting training for {cfg.num_epochs} epochs on {device}...")
@@ -263,6 +265,7 @@ def main():
     best_success_rate = -1.0
     best_val_loss = float('inf')
     global_step = 0
+    start_time = time.time()
 
     policy.train()
     for epoch in range(cfg.num_epochs):
@@ -314,7 +317,7 @@ def main():
             if batch_idx % cfg.log_freq == 0:
                 print(f"Epoch [{epoch+1}/{cfg.num_epochs}], Step [{batch_idx}/{len(train_dataloader)}], Loss: {loss.item():.4f}")
                 if cfg.use_wandb:
-                    wandb.log({"train/step_loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=global_step)
+                    wandb.log({"train/step_loss": loss.item(), "train/lr": scheduler.get_last_lr()[0], "train/elapsed_time": time.time() - start_time}, step=global_step)
                 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"==> Epoch {epoch+1} Average Train Loss: {avg_train_loss:.4f}")
@@ -356,6 +359,7 @@ def main():
             best_val_loss = avg_val_loss
             print(f"🌟 New best model based on Val Loss! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
             policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+            preprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
             
         policy.train() # Set back to train mode
 
@@ -365,6 +369,7 @@ def main():
         # Save latest model every epoch
         os.makedirs(cfg.save_dir, exist_ok=True)
         policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
+        preprocessor.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
         
         # Run online evaluation
         if cfg.run_eval and (epoch + 1) % cfg.eval_freq == 0:
@@ -403,7 +408,7 @@ def main():
     print("\nTraining complete!")
     
     api = HfApi()
-    repo_id = "NLTuan/act-red-blue-policy"
+    repo_id = f"{cfg.hub_repo_id}-lr{cfg.lr}"
     
     # Push best model to main branch
     print(f"Pushing best model to {repo_id} (branch: main)...")
