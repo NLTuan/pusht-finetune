@@ -14,6 +14,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act import ACTConfig, ACTPolicy
+from lerobot.transforms import ImageTransforms, ImageTransformsConfig
 from transformers import get_cosine_schedule_with_warmup
 
 @dataclass
@@ -151,7 +152,8 @@ def main():
 
     delta_timestamps = {"action": [t / cfg.fps for t in range(cfg.action_chunk_size)]}
 
-    dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps)
+    image_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
+    dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
 
     print(f"Total frames in dataset: {len(dataset)}")
     print(f"Total episodes: {dataset.num_episodes}")
@@ -274,21 +276,8 @@ def main():
             # Move batch to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # Data Augmentation for images (to prevent overfitting)
-            if "observation.image" in batch:
-                import torchvision.transforms as T
-                aug = T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02)
-                img = batch["observation.image"]
-                shape = img.shape
-                if len(shape) == 5: # (B, T, C, H, W)
-                    B, T_dim, C, H, W = shape
-                    img_flattened = img.view(B * T_dim, C, H, W)
-                    img_augmented = aug(img_flattened)
-                    batch["observation.image"] = img_augmented.view(B, T_dim, C, H, W)
-                elif len(shape) == 4: # (B, C, H, W)
-                    batch["observation.image"] = aug(img)
-            
             # Preprocess batch (normalize)
+            # Note: image augmentation is handled by LeRobot's ImageTransforms in the DataLoader workers
             batch = preprocessor(batch)
             
             optimizer.zero_grad(set_to_none=True) # Faster than zero_grad()
