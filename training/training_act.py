@@ -40,7 +40,7 @@ class TrainConfig:
     wandb_project: str = "red-blue-act"
     hub_repo_id: str = "NLTuan/act-red-blue-policy"
 
-def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, action_stats):
+def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, postprocessor):
     """Run simulation rollouts to evaluate the policy."""
     import imageio
     import numpy as np
@@ -112,12 +112,10 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, act
                 # select_action automatically handles action chunking history internally!
                 action = policy.select_action(batch)
                 
-                # Unnormalize action
-                mean = torch.from_numpy(action_stats['mean']).to(device)
-                std = torch.from_numpy(action_stats['std']).to(device)
-                unnorm_action = action * std + mean
-                
-                action_np = unnorm_action.squeeze(0).cpu().numpy()
+                # Unnormalize action via LeRobot postprocessor (UnnormalizerProcessorStep + CPU move)
+                # This is the same pipeline used by SyncInferenceEngine and PolicyServer,
+                # so the model is compatible with lerobot-rollout and async inference out of the box.
+                action_np = postprocessor(action).squeeze(0).numpy()
                 
                 obs, reward, terminated, truncated, info = env.step(action_np)
                 current_max_coverage = max(current_max_coverage, reward)
@@ -350,6 +348,7 @@ def main():
             print(f"🌟 New best model based on Val Loss! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
             policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
             preprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+            postprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
             
         policy.train() # Set back to train mode
 
@@ -360,6 +359,7 @@ def main():
         os.makedirs(cfg.save_dir, exist_ok=True)
         policy.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
         preprocessor.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
+        postprocessor.save_pretrained(os.path.join(cfg.save_dir, "latest_model"))
         
         # Run online evaluation
         if cfg.run_eval and (epoch + 1) % cfg.eval_freq == 0:
@@ -368,7 +368,7 @@ def main():
             # We map dataset ID to gym env ID if needed, e.g. lerobot/pusht -> gym_pusht/PushT-v0
             env_id = "gym_pusht/PushT-v0" if "pusht" in cfg.dataset_id else cfg.dataset_id
             
-            success_rate, ever_success_rate, avg_max_coverage, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor, dataset.meta.stats["action"])
+            success_rate, ever_success_rate, avg_max_coverage, video_frames = rollout_and_evaluate(policy, env_id, cfg.num_eval_episodes, device, preprocessor, postprocessor)
             print(f"==> Epoch {epoch+1} Terminal Success Rate: {success_rate * 100:.1f}%, Ever Success Rate: {ever_success_rate * 100:.1f}%, Avg Max Coverage: {avg_max_coverage:.4f}")
             
             if cfg.use_wandb:
@@ -392,6 +392,8 @@ def main():
                 best_success_rate = success_rate
                 print(f"🌟 New best model! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
                 policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                preprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                postprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
                 
     if cfg.use_wandb:
         wandb.finish()
