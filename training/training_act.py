@@ -11,6 +11,7 @@ from huggingface_hub import HfApi
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act import ACTConfig, ACTPolicy
@@ -129,14 +130,20 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
     policy.train()
     return sum(successes) / num_episodes, sum(ever_successes) / num_episodes, sum(max_coverages) / num_episodes, best_video_frames
 
-def run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype):
+def run_validation(policy, val_dataloader, preprocessor, image_transforms, camera_keys, device, use_amp_cuda, pt_dtype):
     """Run the full validation loop and return average loss. Leaves policy in eval mode."""
     policy.eval()
     total_val_loss = torch.zeros(1, device=device)
     amp_ctx = torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if use_amp_cuda else nullcontext()
-    with torch.no_grad():
+    with torch.no_grad(), image_transforms.deterministic():
         for val_batch in val_dataloader:
-            val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+            val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+            
+            # Apply transforms on GPU for uint8 data
+            for cam_key in camera_keys:
+                if cam_key in val_batch:
+                    val_batch[cam_key] = image_transforms(val_batch[cam_key])
+                    
             val_batch = preprocessor(val_batch)
             with amp_ctx:
                 actions_hat = policy.predict_action_chunk(val_batch)
@@ -161,13 +168,16 @@ def save_checkpoint(policy, preprocessor, postprocessor, path):
 def main():
     cfg = TrainConfig()
 
+    # Use metadata for dynamic inspection to save time/memory
+    meta = LeRobotDatasetMetadata(cfg.dataset_id)
+
     delta_timestamps = {"action": [t / cfg.fps for t in range(cfg.action_chunk_size)]}
 
     image_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
-    dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
+    dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=None, return_uint8=True)
 
     # Separate validation dataset — NO augmentations for a stable, clean val loss curve.
-    val_dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=None)
+    val_dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=None, return_uint8=True)
 
     print(f"Total frames in dataset: {len(dataset)}")
     print(f"Total episodes: {dataset.num_episodes}")
@@ -189,6 +199,7 @@ def main():
         num_workers=cfg.num_workers,
         pin_memory=cfg.device.startswith("cuda"),
         persistent_workers=cfg.num_workers > 0,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
     val_sampler = EpisodeAwareSampler(
@@ -201,9 +212,10 @@ def main():
         val_dataset,
         batch_size=cfg.batch_size,
         sampler=val_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=4,               # Validation doesn't need 32 workers
         pin_memory=cfg.device.startswith("cuda"),
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=False,    # Kill val workers after use to free up CPU for training
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
     device = torch.device(cfg.device)
@@ -240,6 +252,7 @@ def main():
 
     policy = ACTPolicy(config)
     policy.to(device)
+    image_transforms.to(device)
 
     if cfg.use_compile and cfg.device.startswith("cuda"):
         print("\nCompiling policy with torch.compile()...")
@@ -308,7 +321,13 @@ def main():
         interval_start_time = time.time()
 
         for batch_idx, batch in enumerate(train_dataloader):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            
+            # Apply image transforms on GPU — significantly faster
+            for cam_key in meta.camera_keys:
+                if cam_key in batch:
+                    batch[cam_key] = image_transforms(batch[cam_key])
+                    
             batch = preprocessor(batch)
 
             optimizer.zero_grad(set_to_none=True)
@@ -363,7 +382,7 @@ def main():
 
             # Mid-epoch validation — fires every val_freq steps when enabled.
             if cfg.val_freq > 0 and global_step % cfg.val_freq == 0:
-                avg_val_loss = run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype)
+                avg_val_loss = run_validation(policy, val_dataloader, preprocessor, image_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
                 print(f"  [Step {global_step}] Val Loss: {avg_val_loss:.4f}")
                 if cfg.use_wandb:
                     wandb.log({"eval/val_loss": avg_val_loss}, step=global_step)
@@ -390,7 +409,7 @@ def main():
             }, step=global_step)
 
         # Epoch-end validation
-        avg_val_loss = run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype)
+        avg_val_loss = run_validation(policy, val_dataloader, preprocessor, image_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
         print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
         if cfg.use_wandb:
             wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
