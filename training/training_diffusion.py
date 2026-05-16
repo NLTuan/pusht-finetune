@@ -141,19 +141,21 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
     return sum(successes) / num_episodes, sum(ever_successes) / num_episodes, sum(max_coverages) / num_episodes, best_video_frames
 
 
-def run_validation(ema_policy, val_dataloader, preprocessor, image_transforms, camera_keys, device, use_amp_cuda, pt_dtype):
+def run_validation(ema_policy, val_dataloader, preprocessor, val_transforms, camera_keys, device, use_amp_cuda, pt_dtype):
     """Run the full validation loop and return average loss. Leaves policy in eval mode."""
     ema_policy.eval()
     total_val_loss = torch.zeros(1, device=device)
     amp_ctx = torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if use_amp_cuda else nullcontext()
-    with torch.no_grad(), image_transforms.deterministic():
+    with torch.no_grad():
         for val_batch in val_dataloader:
             val_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
             
-            # Must apply transforms for uint8 data to be converted to float/normalized
+            # Use val_transforms (Identity) and ensure float normalization for uint8 data
             for cam_key in camera_keys:
                 if cam_key in val_batch:
-                    val_batch[cam_key] = image_transforms(val_batch[cam_key])
+                    val_batch[cam_key] = val_transforms(val_batch[cam_key])
+                    if val_batch[cam_key].dtype == torch.uint8:
+                        val_batch[cam_key] = val_batch[cam_key].float() / 255.0
             
             val_batch = preprocessor(val_batch)
             with amp_ctx:
@@ -176,7 +178,8 @@ def main():
     cfg = TrainConfig()
 
     # Training dataset — with image augmentations
-    image_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
+    train_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
+    val_transforms = ImageTransforms(ImageTransformsConfig(enable=False))  # Deterministic Identity for val
     
     # Load metadata once to inspect features so we can dynamically set delta_timestamps
     meta = LeRobotDatasetMetadata(cfg.dataset_id)
@@ -277,7 +280,8 @@ def main():
 
     policy = DiffusionPolicy(config)
     policy.to(device)
-    image_transforms.to(device)
+    train_transforms.to(device)
+    val_transforms.to(device)
 
     print("\nCreating EMA policy...")
     ema_policy = copy.deepcopy(policy)
@@ -361,7 +365,10 @@ def main():
             # This handles both cameras and arbitrary temporal dimensions (n_obs_steps)
             for cam_key in meta.camera_keys:
                 if cam_key in batch:
-                    batch[cam_key] = image_transforms(batch[cam_key])
+                    batch[cam_key] = train_transforms(batch[cam_key])
+                    # Ensure conversion to float if transforms didn't already do it
+                    if batch[cam_key].dtype == torch.uint8:
+                        batch[cam_key] = batch[cam_key].float() / 255.0
 
             batch = preprocessor(batch)
 
@@ -426,7 +433,7 @@ def main():
 
             # Mid-epoch validation — fires every val_freq steps when enabled.
             if cfg.val_freq > 0 and global_step % cfg.val_freq == 0:
-                avg_val_loss = run_validation(ema_policy, val_dataloader, preprocessor, image_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
+                avg_val_loss = run_validation(ema_policy, val_dataloader, preprocessor, val_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
                 print(f"  [Step {global_step}] Val Loss: {avg_val_loss:.4f}")
                 if cfg.use_wandb:
                     wandb.log({"eval/val_loss": avg_val_loss}, step=global_step)
@@ -453,7 +460,7 @@ def main():
             }, step=global_step)
 
         # Epoch-end validation
-        avg_val_loss = run_validation(ema_policy, val_dataloader, preprocessor, image_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
+        avg_val_loss = run_validation(ema_policy, val_dataloader, preprocessor, val_transforms, meta.camera_keys, device, use_amp_cuda, pt_dtype)
         print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
         if cfg.use_wandb:
             wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
@@ -465,6 +472,9 @@ def main():
 
         # Save latest checkpoint every epoch
         save_checkpoint(ema_policy, preprocessor, postprocessor, os.path.join(cfg.save_dir, "latest_model"))
+        
+        policy.train()
+        train_transforms.train()
 
         # Online evaluation rollouts (sim only)
         if cfg.run_eval and ((epoch + 1) % cfg.eval_freq == 0 or (epoch + 1) == cfg.num_epochs):
