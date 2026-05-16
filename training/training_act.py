@@ -26,13 +26,14 @@ class TrainConfig:
     lr: float = 5e-5
     lr_min: float = 0.0          # LR floor; set equal to lr to disable annealing entirely
     weight_decay: float = 1e-4
+    kl_weight: float = 20.0       # Higher values act as stronger regularization
     num_epochs: int = 20
     log_freq: int = 50
     val_freq: int = 0            # run val every N steps mid-epoch; 0 = epoch-end only
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     use_compile: bool = True
-    num_workers: int = 16
+    num_workers: int = 32
 
     eval_freq: int = 20          # don't eval every epoch, it's slow
     num_eval_episodes: int = 20  # more reliable signal
@@ -151,6 +152,11 @@ def save_checkpoint(policy, preprocessor, postprocessor, path):
     policy.save_pretrained(path)
     preprocessor.save_pretrained(path)
     postprocessor.save_pretrained(path)
+    # Save the training configuration to make results replicable
+    import json
+    from dataclasses import asdict
+    with open(os.path.join(path, "train_config.json"), "w") as f:
+        json.dump(asdict(TrainConfig()), f, indent=4)
 
 def main():
     cfg = TrainConfig()
@@ -229,7 +235,7 @@ def main():
         output_features=output_features,
         chunk_size=cfg.action_chunk_size,
         n_action_steps=cfg.action_chunk_size,
-        kl_weight=10,
+        kl_weight=cfg.kl_weight,
     )
 
     policy = ACTPolicy(config)
