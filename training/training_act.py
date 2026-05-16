@@ -28,6 +28,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     num_epochs: int = 20
     log_freq: int = 50
+    val_freq: int = 0            # run val every N steps mid-epoch; 0 = epoch-end only
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     use_compile: bool = True
@@ -151,6 +152,23 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
     avg_max_coverage = sum(max_coverages) / num_episodes
     return terminal_success_rate, ever_success_rate, avg_max_coverage, best_video_frames
 
+def run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype):
+    """Run the full validation loop and return average loss. Leaves policy in eval mode."""
+    policy.eval()
+    total_val_loss = torch.zeros(1, device=device)
+    amp_ctx = torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if use_amp_cuda else nullcontext()
+    with torch.no_grad():
+        for val_batch in val_dataloader:
+            val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+            val_batch = preprocessor(val_batch)
+            with amp_ctx:
+                actions_hat = policy.predict_action_chunk(val_batch)
+                abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
+                valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
+                v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
+            total_val_loss += v_loss.detach()
+    return (total_val_loss / len(val_dataloader)).item()
+
 def main():
     cfg = TrainConfig()
 
@@ -158,6 +176,10 @@ def main():
 
     image_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
     dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
+    
+    # Create a separate dataset instance for validation with NO augmentations.
+    # This ensures a stable, clean validation loss curve.
+    val_dataset = LeRobotDataset(cfg.dataset_id, delta_timestamps=delta_timestamps, image_transforms=None)
 
     print(f"Total frames in dataset: {len(dataset)}")
     print(f"Total episodes: {dataset.num_episodes}")
@@ -193,7 +215,7 @@ def main():
     )
 
     val_dataloader = DataLoader(
-        dataset,
+        val_dataset,
         batch_size=cfg.batch_size,
         sampler=val_sampler,
         num_workers=cfg.num_workers,
@@ -349,7 +371,21 @@ def main():
                 interval_grad_norm.zero_()
                 interval_count = 0
                 interval_start_time = time.time()
-            
+
+            # Mid-epoch validation — fires every val_freq steps when enabled.
+            if cfg.val_freq > 0 and global_step % cfg.val_freq == 0:
+                avg_val_loss = run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype)
+                print(f"  [Step {global_step}] Val Loss: {avg_val_loss:.4f}")
+                if cfg.use_wandb:
+                    wandb.log({"eval/val_loss": avg_val_loss}, step=global_step)
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    print(f"  🌟 New best model! Saving to {os.path.join(cfg.save_dir, 'best_model')}")
+                    policy.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                    preprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                    postprocessor.save_pretrained(os.path.join(cfg.save_dir, "best_model"))
+                policy.train()
+
         # Single sync per epoch: pull all epoch averages to CPU at once.
         n = len(train_dataloader)
         avg_train_loss = (total_train_loss / n).item()
@@ -363,23 +399,7 @@ def main():
         # ==========================================
         # OFFLINE VALIDATION (Loss on val split)
         # ==========================================
-        policy.eval()
-        total_val_loss = torch.zeros(1, device=device)
-        amp_ctx = torch.amp.autocast(device_type="cuda", dtype=pt_dtype) if use_amp_cuda else nullcontext()
-        with torch.no_grad():
-            for val_batch in val_dataloader:
-                val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
-                val_batch = preprocessor(val_batch)
-                
-                with amp_ctx:
-                    actions_hat = policy.predict_action_chunk(val_batch)
-                    abs_err = torch.nn.functional.l1_loss(val_batch["action"], actions_hat, reduction="none")
-                    valid_mask = ~val_batch["action_is_pad"].unsqueeze(-1)
-                    v_loss = (abs_err * valid_mask).sum() / (valid_mask.sum() * abs_err.shape[-1]).clamp_min(1)
-                    
-                total_val_loss += v_loss.detach()
-                
-        avg_val_loss = (total_val_loss / len(val_dataloader)).item()  # single sync
+        avg_val_loss = run_validation(policy, val_dataloader, preprocessor, device, use_amp_cuda, pt_dtype)
         print(f"==> Epoch {epoch+1} Average Val Loss: {avg_val_loss:.4f}")
         if cfg.use_wandb:
             wandb.log({"eval/val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
@@ -443,6 +463,9 @@ def main():
     
     api = HfApi()
     repo_id = f"{cfg.hub_repo_id}-lr{cfg.lr}"
+    
+    # Create repo if it doesn't exist yet
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
     
     # Push best model to main branch
     print(f"Pushing best model to {repo_id} (branch: main)...")
