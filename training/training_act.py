@@ -23,7 +23,7 @@ class TrainConfig:
     dataset_id: str = "NLTuan/red_blue_cleaned_extra"
     action_chunk_size: int = 50
     fps: int = 10
-    batch_size: int = 8
+    batch_size: int = 32
     lr: float = 5e-5
     lr_min: float = 0.0          # LR floor; set equal to lr to disable annealing entirely
     weight_decay: float = 1e-4
@@ -31,10 +31,10 @@ class TrainConfig:
     num_epochs: int = 20
     log_freq: int = 50
     val_freq: int = 0            # run val every N steps mid-epoch; 0 = epoch-end only
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda"
     use_amp: bool = True
     use_compile: bool = True
-    num_workers: int = 32
+    num_workers: int = 8         # Optimized to prevent thread contention, shared memory fragmentation, and process leaks
 
     eval_freq: int = 20          # don't eval every epoch, it's slow
     num_eval_episodes: int = 20  # more reliable signal
@@ -169,6 +169,8 @@ def save_checkpoint(policy, preprocessor, postprocessor, path):
 
 def main():
     cfg = TrainConfig()
+    if cfg.device == "cuda" and not torch.cuda.is_available():
+        cfg.device = "cpu"
 
     # Use metadata for dynamic inspection to save time/memory
     meta = LeRobotDatasetMetadata(cfg.dataset_id)
@@ -203,7 +205,7 @@ def main():
         sampler=train_sampler,
         num_workers=cfg.num_workers,
         pin_memory=cfg.device.startswith("cuda"),
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=cfg.num_workers > 0,    # Kept alive for absolute process stability (no Errno 11)
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
@@ -217,10 +219,9 @@ def main():
         val_dataset,
         batch_size=cfg.batch_size,
         sampler=val_sampler,
-        num_workers=4,               # Validation doesn't need 32 workers
+        num_workers=0,               # Run in main process to completely avoid fork/multiprocessing leaks and slow starts
         pin_memory=cfg.device.startswith("cuda"),
-        persistent_workers=False,    # Kill val workers after use to free up CPU for training
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        persistent_workers=False,
     )
 
     device = torch.device(cfg.device)
@@ -461,6 +462,12 @@ def main():
 
         policy.train()
         train_transforms.train()
+
+        # Clean up memory/caches to prevent validation/evaluation memory fragmentation from slowing down next training epoch
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     if cfg.use_wandb:
         wandb.finish()

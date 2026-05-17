@@ -23,32 +23,32 @@ from transformers import get_cosine_schedule_with_warmup, get_constant_schedule_
 
 @dataclass
 class TrainConfig:
-    dataset_id: str = "NLTuan/red_blue_cleaned_extra"
-    horizon: int = 16          # Replaces chunk_size in ACT
-    n_obs_steps: int = 2       # Diffusion typically uses a history of observations
-    n_action_steps: int = 6    # Paper: 6 for real Push-T (vs 8 for sim)
+    dataset_id: str = "lerobot/pusht"
+    horizon: int = 16          # Standard for Push-T
+    n_obs_steps: int = 2       
+    n_action_steps: int = 8    # Paper: 8 for sim Push-T
     fps: int = 10
-    batch_size: int = 32       # Increased to 64 to fully saturate the GPU
+    batch_size: int = 64       # 96x96 images are small; 64-128 is great
     lr: float = 1e-4
-    lr_min: float = 0.0        # LR floor; set equal to lr to disable annealing entirely
+    lr_min: float = 0.0        
     weight_decay: float = 1e-6
-    num_epochs: int = 20
+    num_epochs: int = 200      # Sim needs more epochs to hit 90%+ success
     log_freq: int = 50
-    val_freq: int = 0          # run val every N steps mid-epoch; 0 = epoch-end only
-    noise_scheduler_type: str = "DDIM"   # DDIM enables fast inference; use "DDPM" for sim Push-T
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    val_freq: int = 0          
+    noise_scheduler_type: str = "DDPM"   # DDPM for training stability in sim
+    device: str = "cuda"
     use_amp: bool = True
-    use_compile: bool = True     # Re-enabled to reduce Python overhead and improve GPU utilization
-    num_workers: int = 16       # Restored to 32 now that we use 4x less shared memory (uint8)
+    use_compile: bool = True     
+    num_workers: int = 4       # Optimized for 96x96 simulation (prevents thread contention/leaks)
 
-    num_inference_steps: int = 16       # Paper: 16 DDIM steps for real-hardware inference (vs 100 for sim)
-    eval_freq: int = 50
-    num_eval_episodes: int = 10
-    run_eval: bool = False     # real-life data — no simulator available
-    save_dir: str = "checkpoints/diffusion_red_blue"
+    num_inference_steps: int = 100      # Standard for sim Push-T
+    eval_freq: int = 25
+    num_eval_episodes: int = 1
+    run_eval: bool = True      # Simulation is available!
+    save_dir: str = "checkpoints/diffusion_pusht"
     use_wandb: bool = True
-    wandb_project: str = "red-blue-diffusion"
-    hub_repo_id: str = "NLTuan/diffusion-red-blue-policy"
+    wandb_project: str = "pusht-diffusion"
+    hub_repo_id: str = "NLTuan/diffusion-pusht-policy"
 
 
 def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, postprocessor):
@@ -109,7 +109,7 @@ def rollout_and_evaluate(policy, env_id, num_episodes, device, preprocessor, pos
                     batch[image_key] = img_transform(frame).to(device).unsqueeze(0)
                 if has_state:
                     state_key = "observation.state"
-                    batch[state_key] = torch.from_numpy(obs).float().to(device).unsqueeze(0)
+                    batch[state_key] = torch.from_numpy(obs[:2]).float().to(device).unsqueeze(0)
 
                 batch = preprocessor(batch)
                 action = policy.select_action(batch)
@@ -176,6 +176,8 @@ def save_checkpoint(ema_policy, preprocessor, postprocessor, path):
 
 def main():
     cfg = TrainConfig()
+    if cfg.device == "cuda" and not torch.cuda.is_available():
+        cfg.device = "cpu"
 
     # Training dataset — with image augmentations
     train_transforms = ImageTransforms(ImageTransformsConfig(enable=True))
@@ -219,7 +221,7 @@ def main():
         sampler=train_sampler,
         num_workers=cfg.num_workers,
         pin_memory=cfg.device.startswith("cuda"),
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=cfg.num_workers > 0,    # Kept alive for absolute process stability (no Errno 11)
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
@@ -233,10 +235,9 @@ def main():
         val_dataset,
         batch_size=cfg.batch_size,
         sampler=val_sampler,
-        num_workers=4,               # Validation doesn't need 16 workers
+        num_workers=0,               # Run in main process to completely avoid fork/multiprocessing leaks and slow starts
         pin_memory=cfg.device.startswith("cuda"),
-        persistent_workers=False,    # Kill these workers when not validating to free up CPU
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        persistent_workers=False,
     )
 
     device = torch.device(cfg.device)
@@ -271,8 +272,8 @@ def main():
         n_action_steps=cfg.n_action_steps,
         noise_scheduler_type=cfg.noise_scheduler_type,
         num_inference_steps=cfg.num_inference_steps,
-        resize_shape=(320, 240),        # Real camera resolution (paper: 2×320×240)
-        crop_shape=(288, 216),          # Paper: 2×288×216 crop
+        resize_shape=(96, 96),          # Standard Push-T sim resolution
+        crop_shape=(84, 84),            # Standard 84x84 crop
         crop_is_random=True,
         use_group_norm=True,
         pretrained_backbone_weights=None,
@@ -504,6 +505,13 @@ def main():
                 save_checkpoint(ema_policy, preprocessor, postprocessor, os.path.join(cfg.save_dir, "best_model_rollout"))
 
         policy.train()
+        train_transforms.train()
+
+        # Clean up memory/caches to prevent validation/evaluation memory fragmentation from slowing down next training epoch
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     if cfg.use_wandb:
         wandb.finish()
